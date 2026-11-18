@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
+using UnityEditor.IMGUI.Controls;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -11,11 +12,14 @@ namespace Bro.ReferenceRadar
     public class ReferenceWindow : EditorWindow
     {
         private static readonly string[] ModeLabels = { "Used By", "Uses" };
-        private static readonly Comparison<ResultEntry> CompareByPath = (a, b) => string.Compare(a.Path, b.Path, StringComparison.Ordinal);
-
         private int _mode;
+        [SerializeField] private AssetKind _assetFilter = AssetKind.All;
+        [SerializeField] private SortMode _sortMode;
+        [SerializeField] private string _nameSearch = string.Empty;
+        [NonSerialized] private SearchField _searchField;
         private Vector2 _scrollPosition;
         private readonly List<ResultEntry> _results = new();
+        private readonly List<ResultEntry> _visibleResults = new();
         private string[] _selectedGuids = Array.Empty<string>();
         [NonSerialized] private GUIStyle _rowStyle;
         private double _lastCacheCheckTime;
@@ -23,11 +27,48 @@ namespace Bro.ReferenceRadar
         private bool _isSceneSelection;
         private GameObject _selectedGameObject;
         private readonly List<SceneResultEntry> _sceneResults = new();
+        private readonly List<SceneResultEntry> _visibleSceneResults = new();
 
-        private struct ResultEntry
+        private enum SortMode
         {
-            public string Guid;
-            public string Path;
+            Name,
+            Type
+        }
+
+        // Categories are in alphabetical display order, with Other last.
+        [Flags]
+        private enum AssetKind
+        {
+            Animation = 1 << 0,
+            Audio = 1 << 1,
+            Folder = 1 << 2,
+            Font = 1 << 3,
+            Material = 1 << 4,
+            Mesh = 1 << 5,
+            Model = 1 << 6,
+            Prefab = 1 << 7,
+            Scene = 1 << 8,
+            Script = 1 << 9,
+            ScriptableObject = 1 << 10,
+            Shader = 1 << 11,
+            Text = 1 << 12,
+            Texture = 1 << 13,
+            Other = 1 << 14,
+            All = -1
+        }
+
+        private readonly struct ResultEntry
+        {
+            public readonly string Path;
+            public readonly string FileName;
+            public readonly AssetKind Kind;
+
+            public ResultEntry(string path)
+            {
+                Path = path;
+                FileName = System.IO.Path.GetFileName(path);
+                Kind = GetAssetKind(path);
+            }
         }
 
         private struct SceneResultEntry
@@ -58,6 +99,8 @@ namespace Bro.ReferenceRadar
 
             EditorApplication.hierarchyChanged -= InvalidateSceneMap;
             EditorApplication.hierarchyChanged += InvalidateSceneMap;
+
+            OnSelectionChange();
         }
 
         private void OnDisable()
@@ -87,8 +130,6 @@ namespace Bro.ReferenceRadar
 
         private void InvalidateSceneMap()
         {
-            _sceneResults.Clear();
-
             if (_isSceneSelection)
             {
                 RebuildResults();
@@ -99,7 +140,6 @@ namespace Bro.ReferenceRadar
 
         private void OnSelectionChange()
         {
-            _sceneResults.Clear();
             var activeGo = Selection.activeGameObject;
             var isSceneObject = activeGo != null && activeGo.scene.IsValid() && !EditorUtility.IsPersistent(activeGo);
             if (isSceneObject)
@@ -113,15 +153,7 @@ namespace Bro.ReferenceRadar
             }
             _isSceneSelection = false;
             _selectedGameObject = null;
-            var guids = Selection.assetGUIDs;
-            if (guids == null || guids.Length == 0)
-            {
-                _selectedGuids = Array.Empty<string>();
-                _results.Clear();
-                Repaint();
-                return;
-            }
-            _selectedGuids = guids;
+            _selectedGuids = Selection.assetGUIDs ?? Array.Empty<string>();
             RebuildResults();
             Repaint();
         }
@@ -129,30 +161,90 @@ namespace Bro.ReferenceRadar
         private void RebuildResults()
         {
             _results.Clear();
+            _sceneResults.Clear();
             if (_isSceneSelection)
             {
                 RebuildSceneObjectResults();
-                return;
             }
-            if (!ProjectOverlay.IsReady)
+            else if (ProjectOverlay.IsReady)
             {
-                return;
+                var cache = ProjectOverlay.Cache;
+                var seen = new HashSet<string>(_selectedGuids);
+                if (_mode == 0)
+                {
+                    CollectUsedBy(cache, seen);
+                }
+                else
+                {
+                    CollectUses(cache, seen);
+                }
             }
-            var cache = ProjectOverlay.Cache;
-            var seen = new HashSet<string>();
-            foreach (var guid in _selectedGuids)
+            UpdateVisibleResults();
+        }
+
+        private void UpdateVisibleResults()
+        {
+            var query = _nameSearch?.Trim();
+            _visibleResults.Clear();
+            foreach (var result in _results)
             {
-                seen.Add(guid);
+                if ((_assetFilter & result.Kind) != 0 && MatchesName(result.FileName, query))
+                {
+                    _visibleResults.Add(result);
+                }
             }
-            if (_mode == 0)
+            _visibleResults.Sort(_sortMode == SortMode.Type ? CompareByType : CompareByName);
+
+            _visibleSceneResults.Clear();
+            foreach (var result in _sceneResults)
             {
-                CollectUsedBy(cache, seen);
+                if (result.GameObject != null && MatchesName(result.GameObject.name, query))
+                {
+                    _visibleSceneResults.Add(result);
+                }
             }
-            else
+        }
+
+        private static bool MatchesName(string name, string query)
+        {
+            return string.IsNullOrEmpty(query) || name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static int CompareByName(ResultEntry a, ResultEntry b)
+        {
+            var nameOrder = StringComparer.OrdinalIgnoreCase.Compare(a.FileName, b.FileName);
+            return nameOrder != 0 ? nameOrder : string.CompareOrdinal(a.Path, b.Path);
+        }
+
+        private static int CompareByType(ResultEntry a, ResultEntry b)
+        {
+            var typeOrder = ((int)a.Kind).CompareTo((int)b.Kind);
+            return typeOrder != 0 ? typeOrder : CompareByName(a, b);
+        }
+
+        private static AssetKind GetAssetKind(string path)
+        {
+            var type = AssetDatabase.GetMainAssetTypeAtPath(path);
+            if (type == typeof(GameObject))
             {
-                CollectUses(cache, seen);
+                return AssetImporter.GetAtPath(path) is ModelImporter ? AssetKind.Model : AssetKind.Prefab;
             }
-            _results.Sort(CompareByPath);
+            if (type == typeof(DefaultAsset) && AssetDatabase.IsValidFolder(path)) return AssetKind.Folder;
+            if (type == typeof(MonoScript)) return AssetKind.Script;
+            if (type == typeof(SceneAsset)) return AssetKind.Scene;
+            if (type == typeof(Shader) || type == typeof(ComputeShader)) return AssetKind.Shader;
+            if (type == typeof(Sprite) || typeof(Texture).IsAssignableFrom(type)) return AssetKind.Texture;
+            if (type == typeof(Material)) return AssetKind.Material;
+            if (type == typeof(AnimationClip) || typeof(RuntimeAnimatorController).IsAssignableFrom(type))
+            {
+                return AssetKind.Animation;
+            }
+            if (type == typeof(AudioClip) || type == typeof(UnityEngine.Audio.AudioMixer)) return AssetKind.Audio;
+            if (type == typeof(Font)) return AssetKind.Font;
+            if (type == typeof(Mesh)) return AssetKind.Mesh;
+            if (typeof(ScriptableObject).IsAssignableFrom(type)) return AssetKind.ScriptableObject;
+            if (type == typeof(TextAsset)) return AssetKind.Text;
+            return AssetKind.Other;
         }
 
         private void RebuildSceneObjectResults()
@@ -179,9 +271,8 @@ namespace Bro.ReferenceRadar
                     {
                         continue;
                     }
-                    _results.Add(new ResultEntry { Guid = guid, Path = path });
+                    _results.Add(new ResultEntry(path));
                 }
-                _results.Sort(CompareByPath);
                 // Uses: scene object references
                 var sceneRefs = SceneScanner.ScanGameObjectSceneRefs(_selectedGameObject);
                 foreach (var sceneRef in sceneRefs)
@@ -228,7 +319,7 @@ namespace Bro.ReferenceRadar
                     {
                         continue;
                     }
-                    _results.Add(new ResultEntry { Guid = kvp.Key, Path = path });
+                    _results.Add(new ResultEntry(path));
                 }
             }
         }
@@ -253,7 +344,7 @@ namespace Bro.ReferenceRadar
                     {
                         continue;
                     }
-                    _results.Add(new ResultEntry { Guid = guid, Path = path });
+                    _results.Add(new ResultEntry(path));
                 }
             }
         }
@@ -296,10 +387,11 @@ namespace Bro.ReferenceRadar
                 }
                 EnsureStyles();
                 _scrollPosition = EditorGUILayout.BeginScrollView(_scrollPosition);
-                if (_sceneResults.Count > 0)
+                DrawFilterEmptyState();
+                if (_visibleSceneResults.Count > 0)
                 {
                     EditorGUILayout.LabelField("Scene References", EditorStyles.boldLabel);
-                    foreach (var result in _sceneResults)
+                    foreach (var result in _visibleSceneResults)
                     {
                         if (result.GameObject == null)
                         {
@@ -308,11 +400,11 @@ namespace Bro.ReferenceRadar
                         DrawSceneResultRow(result);
                     }
                 }
-                if (_mode == 1 && _results.Count > 0)
+                if (_mode == 1 && _visibleResults.Count > 0)
                 {
                     EditorGUILayout.Space(4);
                     EditorGUILayout.LabelField("Asset References", EditorStyles.boldLabel);
-                    foreach (var result in _results)
+                    foreach (var result in _visibleResults)
                     {
                         DrawResultRow(result);
                     }
@@ -338,8 +430,28 @@ namespace Bro.ReferenceRadar
             if (newMode != _mode)
             {
                 _mode = newMode;
-                _sceneResults.Clear();
                 RebuildResults();
+            }
+
+            AssetKind filter;
+            SortMode sort;
+            using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
+            {
+                GUILayout.Label("Types", EditorStyles.miniLabel, GUILayout.Width(34));
+                filter = (AssetKind)EditorGUILayout.EnumFlagsField(_assetFilter, EditorStyles.toolbarPopup, GUILayout.ExpandWidth(true));
+                GUILayout.Label("Sort", EditorStyles.miniLabel, GUILayout.Width(25));
+                sort = (SortMode)EditorGUILayout.EnumPopup(_sortMode, EditorStyles.toolbarPopup, GUILayout.Width(62));
+            }
+
+            _searchField ??= new SearchField();
+            var search = _searchField.OnToolbarGUI(_nameSearch ?? string.Empty);
+            if (filter != _assetFilter || sort != _sortMode || search != _nameSearch)
+            {
+                _assetFilter = filter;
+                _sortMode = sort;
+                _nameSearch = search;
+                _scrollPosition = Vector2.zero;
+                UpdateVisibleResults();
             }
             EditorGUILayout.Space(2);
         }
@@ -416,7 +528,8 @@ namespace Bro.ReferenceRadar
             EnsureStyles();
             _scrollPosition = EditorGUILayout.BeginScrollView(_scrollPosition);
             const float rowHeight = 20f;
-            var total = _results.Count;
+            var total = _visibleResults.Count;
+            DrawFilterEmptyState();
             if (total > 0)
             {
                 var viewHeight = position.height;
@@ -428,7 +541,7 @@ namespace Bro.ReferenceRadar
                 }
                 for (var i = firstVisible; i <= lastVisible; i++)
                 {
-                    DrawResultRow(_results[i]);
+                    DrawResultRow(_visibleResults[i]);
                 }
                 var remaining = total - lastVisible - 1;
                 if (remaining > 0)
@@ -439,11 +552,18 @@ namespace Bro.ReferenceRadar
             EditorGUILayout.EndScrollView();
         }
 
+        private void DrawFilterEmptyState()
+        {
+            if (_results.Count + _sceneResults.Count > 0 && _visibleResults.Count + _visibleSceneResults.Count == 0)
+            {
+                EditorGUILayout.HelpBox("No references match the current filters.", MessageType.Info);
+            }
+        }
+
         private void DrawResultRow(ResultEntry result)
         {
-            var fileName = Path.GetFileName(result.Path);
             var icon = AssetDatabase.GetCachedIcon(result.Path);
-            var content = new GUIContent(" " + fileName, icon, result.Path);
+            var content = new GUIContent(" " + result.FileName, icon, result.Path);
             if (GUILayout.Button(content, _rowStyle, GUILayout.Height(20)))
             {
                 var asset = AssetDatabase.LoadMainAssetAtPath(result.Path);
@@ -459,9 +579,10 @@ namespace Bro.ReferenceRadar
             EditorGUILayout.Space(2);
             EditorGUILayout.BeginHorizontal();
             
+            var assetCount = FormatResultCount(_visibleResults.Count, _results.Count);
             var label = _sceneResults.Count > 0
-                ? $"{_results.Count} project, {_sceneResults.Count} scene references"
-                : $"{_results.Count} references";
+                ? $"{assetCount} project, {FormatResultCount(_visibleSceneResults.Count, _sceneResults.Count)} scene references"
+                : $"{assetCount} references";
             
             EditorGUILayout.LabelField(label, EditorStyles.miniLabel);
             var settingsIcon = EditorGUIUtility.IconContent("d_Settings");
@@ -477,6 +598,11 @@ namespace Bro.ReferenceRadar
                 PerformScan(false);
             }
             EditorGUILayout.EndHorizontal();
+        }
+
+        private static string FormatResultCount(int visible, int total)
+        {
+            return visible == total ? total.ToString() : $"{visible}/{total}";
         }
 
         private static void SelectOrCreateSettings()
